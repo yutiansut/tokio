@@ -12,13 +12,31 @@ use std::task::{Context, Poll};
 cfg_tcp! {
     /// A TCP socket server, listening for connections.
     ///
+    /// You can accept a new connection by using the [`accept`](`TcpListener::accept`) method. Alternatively `TcpListener`
+    /// implements the [`Stream`](`crate::stream::Stream`) trait, which allows you to use the listener in places that want a
+    /// stream. The stream will never return `None` and will also not yield the peer's `SocketAddr` structure.  Iterating over
+    /// it is equivalent to calling accept in a loop.
+    ///
+    /// # Errors
+    ///
+    /// Note that accepting a connection can lead to various errors and not all
+    /// of them are necessarily fatal ‒ for example having too many open file
+    /// descriptors or the other side closing the connection while it waits in
+    /// an accept queue. These would terminate the stream if not handled in any
+    /// way.
+    ///
     /// # Examples
     ///
+    /// Using `accept`:
     /// ```no_run
     /// use tokio::net::TcpListener;
     ///
     /// use std::io;
-    /// # async fn process_socket<T>(_socket: T) {}
+    ///
+    /// async fn process_socket<T>(socket: T) {
+    ///     # drop(socket);
+    ///     // do work with socket here
+    /// }
     ///
     /// #[tokio::main]
     /// async fn main() -> io::Result<()> {
@@ -27,6 +45,24 @@ cfg_tcp! {
     ///     loop {
     ///         let (socket, _) = listener.accept().await?;
     ///         process_socket(socket).await;
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// Using `impl Stream`:
+    /// ```no_run
+    /// use tokio::{net::TcpListener, stream::StreamExt};
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let mut listener = TcpListener::bind("127.0.0.1:8080").await.unwrap();
+    ///     while let Some(stream) = listener.next().await {
+    ///         match stream {
+    ///             Ok(stream) => {
+    ///                 println!("new client!");
+    ///             }
+    ///             Err(e) => { /* connection failed */ }
+    ///         }
     ///     }
     /// }
     /// ```
@@ -83,7 +119,7 @@ impl TcpListener {
         Err(last_err.unwrap_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "could not resolve to any addresses",
+                "could not resolve to any address",
             )
         }))
     }
@@ -93,13 +129,13 @@ impl TcpListener {
         TcpListener::new(listener)
     }
 
-    /// Accept a new incoming connection from this listener.
+    /// Accepts a new incoming connection from this listener.
     ///
     /// This function will yield once a new TCP connection is established. When
     /// established, the corresponding [`TcpStream`] and the remote peer's
     /// address will be returned.
     ///
-    /// [`TcpStream`]: ../struct.TcpStream.html
+    /// [`TcpStream`]: struct@crate::net::TcpStream
     ///
     /// # Examples
     ///
@@ -124,7 +160,10 @@ impl TcpListener {
         poll_fn(|cx| self.poll_accept(cx)).await
     }
 
-    #[doc(hidden)] // TODO: document
+    /// Attempts to poll `SocketAddr` and `TcpStream` bound to this address.
+    ///
+    /// In case if I/O resource isn't ready yet, `Poll::Pending` is returned and
+    /// current task will be notified by a waker.
     pub fn poll_accept(
         &mut self,
         cx: &mut Context<'_>,
@@ -153,7 +192,7 @@ impl TcpListener {
         }
     }
 
-    /// Create a new TCP listener from the standard library's TCP listener.
+    /// Creates a new TCP listener from the standard library's TCP listener.
     ///
     /// This method can be used when the `Handle::tcp_listen` method isn't
     /// sufficient because perhaps some more configuration is needed in terms of
@@ -191,6 +230,14 @@ impl TcpListener {
     ///     Ok(())
     /// }
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// This function panics if thread-local runtime is not set.
+    ///
+    /// The runtime is usually set implicitly when this function is called
+    /// from a future driven by a tokio runtime, otherwise runtime can be set
+    /// explicitly with [`Handle::enter`](crate::runtime::Handle::enter) function.
     pub fn from_std(listener: net::TcpListener) -> io::Result<TcpListener> {
         let io = mio::net::TcpListener::from_std(listener)?;
         let io = PollEvented::new(io)?;
@@ -229,18 +276,42 @@ impl TcpListener {
         self.io.get_ref().local_addr()
     }
 
-    /// Consumes this listener, returning a stream of the sockets this listener
-    /// accepts.
+    /// Returns a stream over the connections being received on this listener.
     ///
-    /// This method returns an implementation of the `Stream` trait which
-    /// resolves to the sockets the are accepted on this listener.
+    /// Note that `TcpListener` also directly implements `Stream`.
+    ///
+    /// The returned stream will never return `None` and will also not yield the
+    /// peer's `SocketAddr` structure. Iterating over it is equivalent to
+    /// calling accept in a loop.
     ///
     /// # Errors
     ///
-    /// Note that accepting a connection can lead to various errors and not all of them are
-    /// necessarily fatal ‒ for example having too many open file descriptors or the other side
-    /// closing the connection while it waits in an accept queue. These would terminate the stream
-    /// if not handled in any way.
+    /// Note that accepting a connection can lead to various errors and not all
+    /// of them are necessarily fatal ‒ for example having too many open file
+    /// descriptors or the other side closing the connection while it waits in
+    /// an accept queue. These would terminate the stream if not handled in any
+    /// way.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use tokio::{net::TcpListener, stream::StreamExt};
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let mut listener = TcpListener::bind("127.0.0.1:8080").await.unwrap();
+    ///     let mut incoming = listener.incoming();
+    ///
+    ///     while let Some(stream) = incoming.next().await {
+    ///         match stream {
+    ///             Ok(stream) => {
+    ///                 println!("new client!");
+    ///             }
+    ///             Err(e) => { /* connection failed */ }
+    ///         }
+    ///     }
+    /// }
+    /// ```
     pub fn incoming(&mut self) -> Incoming<'_> {
         Incoming::new(self)
     }
@@ -295,6 +366,19 @@ impl TcpListener {
     /// ```
     pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
         self.io.get_ref().set_ttl(ttl)
+    }
+}
+
+#[cfg(feature = "stream")]
+impl crate::stream::Stream for TcpListener {
+    type Item = io::Result<TcpStream>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let (socket, _) = ready!(self.poll_accept(cx))?;
+        Poll::Ready(Some(Ok(socket)))
     }
 }
 

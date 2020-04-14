@@ -1,4 +1,5 @@
-use crate::runtime::{blocking, io, time, Spawner};
+use crate::runtime::{blocking, context, io, time, Spawner};
+use std::{error, fmt};
 
 cfg_rt_core! {
     use crate::task::JoinHandle;
@@ -6,7 +7,12 @@ cfg_rt_core! {
     use std::future::Future;
 }
 
-/// Handle to the runtime
+/// Handle to the runtime.
+///
+/// The handle is internally reference-counted and can be freely cloned. A handle can be
+/// obtained using the [`Runtime::handle`] method.
+///
+/// [`Runtime::handle`]: crate::runtime::Runtime::handle()
 #[derive(Debug, Clone)]
 pub struct Handle {
     pub(super) spawner: Spawner,
@@ -25,22 +31,57 @@ pub struct Handle {
 }
 
 impl Handle {
-    /// Enter the runtime context
+    /// Enter the runtime context.
     pub fn enter<F, R>(&self, f: F) -> R
     where
         F: FnOnce() -> R,
     {
-        self.blocking_spawner.enter(|| {
-            let _io = io::set_default(&self.io_handle);
+        context::enter(self.clone(), f)
+    }
 
-            time::with_default(&self.time_handle, &self.clock, || self.spawner.enter(f))
-        })
+    /// Returns a Handle view over the currently running Runtime
+    ///
+    /// # Panic
+    ///
+    /// This will panic if called outside the context of a Tokio runtime.
+    ///
+    /// # Examples
+    ///
+    /// This can be used to obtain the handle of the surrounding runtime from an async
+    /// block or function running on that runtime.
+    ///
+    /// ```
+    /// # use tokio::runtime::Runtime;
+    /// # fn dox() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.spawn(async {
+    /// use tokio::runtime::Handle;
+    ///
+    /// // Inside an async block or function.
+    /// let handle = Handle::current();
+    /// handle.spawn(async {
+    ///     println!("now running in the existing Runtime");
+    /// })
+    /// # });
+    /// # }
+    /// ```
+    pub fn current() -> Self {
+        context::current().expect("not currently running on the Tokio runtime.")
+    }
+
+    /// Returns a Handle view over the currently running Runtime
+    ///
+    /// Returns an error if no Runtime has been started
+    ///
+    /// Contrary to `current`, this never panics
+    pub fn try_current() -> Result<Self, TryCurrentError> {
+        context::current().ok_or(TryCurrentError(()))
     }
 }
 
 cfg_rt_core! {
     impl Handle {
-        /// Spawn a future onto the Tokio runtime.
+        /// Spawns a future onto the Tokio runtime.
         ///
         /// This spawns the given future onto the runtime's executor, usually a
         /// thread pool. The thread pool is then responsible for polling the future
@@ -80,3 +121,20 @@ cfg_rt_core! {
         }
     }
 }
+
+/// Error returned by `try_current` when no Runtime has been started
+pub struct TryCurrentError(());
+
+impl fmt::Debug for TryCurrentError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TryCurrentError").finish()
+    }
+}
+
+impl fmt::Display for TryCurrentError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("no tokio Runtime has been initialized")
+    }
+}
+
+impl error::Error for TryCurrentError {}

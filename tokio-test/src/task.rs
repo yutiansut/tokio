@@ -1,12 +1,15 @@
 //! Futures task based helpers
 
-use futures_core::Stream;
+#![allow(clippy::mutex_atomic)]
+
 use std::future::Future;
 use std::mem;
 use std::ops;
 use std::pin::Pin;
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+use tokio::stream::Stream;
 
 /// TOOD: dox
 pub fn spawn<T>(task: T) -> Spawn<T> {
@@ -42,7 +45,7 @@ const WAKE: usize = 1;
 const SLEEP: usize = 2;
 
 impl<T> Spawn<T> {
-    /// Consume `self` returning the inner value
+    /// Consumes `self` returning the inner value
     pub fn into_inner(mut self) -> T
     where
         T: Unpin,
@@ -98,7 +101,7 @@ impl<T: Unpin> ops::DerefMut for Spawn<T> {
 }
 
 impl<T: Future> Spawn<T> {
-    /// Poll a future
+    /// Polls a future
     pub fn poll(&mut self) -> Poll<T::Output> {
         let fut = self.future.as_mut();
         self.task.enter(|cx| fut.poll(cx))
@@ -106,7 +109,7 @@ impl<T: Future> Spawn<T> {
 }
 
 impl<T: Stream> Spawn<T> {
-    /// Poll a stream
+    /// Polls a stream
     pub fn poll_next(&mut self) -> Poll<Option<T::Item>> {
         let stream = self.future.as_mut();
         self.task.enter(|cx| stream.poll_next(cx))
@@ -114,14 +117,14 @@ impl<T: Stream> Spawn<T> {
 }
 
 impl MockTask {
-    /// Create a new mock task
+    /// Creates new mock task
     fn new() -> Self {
         MockTask {
             waker: Arc::new(ThreadWaker::new()),
         }
     }
 
-    /// Run a closure from the context of the task.
+    /// Runs a closure from the context of the task.
     ///
     /// Any wake notifications resulting from the execution of the closure are
     /// tracked.
@@ -187,8 +190,7 @@ impl ThreadWaker {
     }
 
     fn wake(&self) {
-        // First, try transitioning from IDLE -> NOTIFY, this does not require a
-        // lock.
+        // First, try transitioning from IDLE -> NOTIFY, this does not require a lock.
         let mut state = self.state.lock().unwrap();
         let prev = *state;
 

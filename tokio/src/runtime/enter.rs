@@ -5,8 +5,6 @@ use std::marker::PhantomData;
 thread_local!(static ENTERED: Cell<bool> = Cell::new(false));
 
 /// Represents an executor context.
-///
-/// For more details, see [`enter` documentation](fn.enter.html)
 pub(crate) struct Enter {
     _p: PhantomData<RefCell<()>>,
 }
@@ -65,7 +63,7 @@ pub(crate) fn exit<F: FnOnce() -> R, R>(f: F) -> R {
 
     let reset = Reset;
     let ret = f();
-    ::std::mem::forget(reset);
+    std::mem::forget(reset);
 
     ENTERED.with(|c| {
         assert!(!c.get(), "closure claimed permanent executor");
@@ -76,10 +74,13 @@ pub(crate) fn exit<F: FnOnce() -> R, R>(f: F) -> R {
 }
 
 cfg_blocking_impl! {
+    use crate::park::ParkError;
+    use std::time::Duration;
+
     impl Enter {
         /// Blocks the thread on the specified future, returning the value with
         /// which that future completes.
-        pub(crate) fn block_on<F>(&mut self, mut f: F) -> F::Output
+        pub(crate) fn block_on<F>(&mut self, mut f: F) -> Result<F::Output, ParkError>
         where
             F: std::future::Future,
         {
@@ -89,7 +90,7 @@ cfg_blocking_impl! {
             use std::task::Poll::Ready;
 
             let mut park = CachedParkThread::new();
-            let waker = park.unpark().into_waker();
+            let waker = park.get_unpark()?.into_waker();
             let mut cx = Context::from_waker(&waker);
 
             // `block_on` takes ownership of `f`. Once it is pinned here, the original `f` binding can
@@ -97,10 +98,49 @@ cfg_blocking_impl! {
             let mut f = unsafe { Pin::new_unchecked(&mut f) };
 
             loop {
-                if let Ready(v) = f.as_mut().poll(&mut cx) {
-                    return v;
+                if let Ready(v) = crate::coop::budget(|| f.as_mut().poll(&mut cx)) {
+                    return Ok(v);
                 }
-                park.park().unwrap();
+
+                park.park()?;
+            }
+        }
+
+        /// Blocks the thread on the specified future for **at most** `timeout`
+        ///
+        /// If the future completes before `timeout`, the result is returned. If
+        /// `timeout` elapses, then `Err` is returned.
+        pub(crate) fn block_on_timeout<F>(&mut self, mut f: F, timeout: Duration) -> Result<F::Output, ParkError>
+        where
+            F: std::future::Future,
+        {
+            use crate::park::{CachedParkThread, Park};
+            use std::pin::Pin;
+            use std::task::Context;
+            use std::task::Poll::Ready;
+            use std::time::Instant;
+
+            let mut park = CachedParkThread::new();
+            let waker = park.get_unpark()?.into_waker();
+            let mut cx = Context::from_waker(&waker);
+
+            // `block_on` takes ownership of `f`. Once it is pinned here, the original `f` binding can
+            // no longer be accessed, making the pinning safe.
+            let mut f = unsafe { Pin::new_unchecked(&mut f) };
+            let when = Instant::now() + timeout;
+
+            loop {
+                if let Ready(v) = crate::coop::budget(|| f.as_mut().poll(&mut cx)) {
+                    return Ok(v);
+                }
+
+                let now = Instant::now();
+
+                if now >= when {
+                    return Err(());
+                }
+
+                park.park_timeout(when - now)?;
             }
         }
     }

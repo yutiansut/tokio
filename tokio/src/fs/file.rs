@@ -1,11 +1,11 @@
 //! Types for working with [`File`].
 //!
-//! [`File`]: file/struct.File.html
+//! [`File`]: File
 
 use self::State::*;
 use crate::fs::{asyncify, sys};
 use crate::io::blocking::Buf;
-use crate::io::{AsyncRead, AsyncWrite};
+use crate::io::{AsyncRead, AsyncSeek, AsyncWrite};
 
 use std::fmt;
 use std::fs::{Metadata, Permissions};
@@ -29,7 +29,7 @@ use std::task::Poll::*;
 ///
 /// Files are automatically closed when they go out of scope.
 ///
-/// [std]: https://doc.rust-lang.org/std/fs/struct.File.html
+/// [std]: std::fs::File
 ///
 /// # Examples
 ///
@@ -90,7 +90,7 @@ impl File {
     ///
     /// See [`OpenOptions`] for more details.
     ///
-    /// [`OpenOptions`]: struct.OpenOptions.html
+    /// [`OpenOptions`]: super::OpenOptions
     ///
     /// # Errors
     ///
@@ -128,14 +128,14 @@ impl File {
     ///
     /// See [`OpenOptions`] for more details.
     ///
-    /// [`OpenOptions`]: struct.OpenOptions.html
+    /// [`OpenOptions`]: super::OpenOptions
     ///
     /// # Errors
     ///
     /// Results in an error if called from outside of the Tokio runtime or if
     /// the underlying [`create`] call results in an error.
     ///
-    /// [`create`]: https://doc.rust-lang.org/std/fs/struct.File.html#method.create
+    /// [`create`]: std::fs::File::create
     ///
     /// # Examples
     ///
@@ -155,10 +155,10 @@ impl File {
         Ok(File::from_std(std_file))
     }
 
-    /// Convert a [`std::fs::File`][std] to a [`tokio_fs::File`][file].
+    /// Converts a [`std::fs::File`][std] to a [`tokio::fs::File`][file].
     ///
-    /// [std]: https://doc.rust-lang.org/std/fs/struct.File.html
-    /// [file]: struct.File.html
+    /// [std]: std::fs::File
+    /// [file]: File
     ///
     /// # Examples
     ///
@@ -176,7 +176,7 @@ impl File {
         }
     }
 
-    /// Seek to an offset, in bytes, in a stream.
+    /// Seeks to an offset, in bytes, in a stream.
     ///
     /// # Examples
     ///
@@ -394,6 +394,59 @@ impl File {
         Ok(File::from_std(std_file))
     }
 
+    /// Destructures `File` into a [`std::fs::File`][std]. This function is
+    /// async to allow any in-flight operations to complete.
+    ///
+    /// Use `File::try_into_std` to attempt conversion immediately.
+    ///
+    /// [std]: std::fs::File
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use tokio::fs::File;
+    ///
+    /// # async fn dox() -> std::io::Result<()> {
+    /// let tokio_file = File::open("foo.txt").await?;
+    /// let std_file = tokio_file.into_std().await;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn into_std(mut self) -> sys::File {
+        self.complete_inflight().await;
+        Arc::try_unwrap(self.std).expect("Arc::try_unwrap failed")
+    }
+
+    /// Tries to immediately destructure `File` into a [`std::fs::File`][std].
+    ///
+    /// [std]: std::fs::File
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error containing the file if some
+    /// operation is in-flight.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use tokio::fs::File;
+    ///
+    /// # async fn dox() -> std::io::Result<()> {
+    /// let tokio_file = File::open("foo.txt").await?;
+    /// let std_file = tokio_file.try_into_std().unwrap();
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn try_into_std(mut self) -> Result<sys::File, Self> {
+        match Arc::try_unwrap(self.std) {
+            Ok(file) => Ok(file),
+            Err(std_file_arc) => {
+                self.std = std_file_arc;
+                Err(self)
+            }
+        }
+    }
+
     /// Changes the permissions on the underlying file.
     ///
     /// # Platform-specific behavior
@@ -492,6 +545,76 @@ impl AsyncRead for File {
                             self.state = Idle(Some(buf));
                             continue;
                         }
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl AsyncSeek for File {
+    fn start_seek(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        mut pos: SeekFrom,
+    ) -> Poll<io::Result<()>> {
+        loop {
+            match self.state {
+                Idle(ref mut buf_cell) => {
+                    let mut buf = buf_cell.take().unwrap();
+
+                    // Factor in any unread data from the buf
+                    if !buf.is_empty() {
+                        let n = buf.discard_read();
+
+                        if let SeekFrom::Current(ref mut offset) = pos {
+                            *offset += n;
+                        }
+                    }
+
+                    let std = self.std.clone();
+
+                    self.state = Busy(sys::run(move || {
+                        let res = (&*std).seek(pos);
+                        (Operation::Seek(res), buf)
+                    }));
+
+                    return Ready(Ok(()));
+                }
+                Busy(ref mut rx) => {
+                    let (op, buf) = ready!(Pin::new(rx).poll(cx))?;
+                    self.state = Idle(Some(buf));
+
+                    match op {
+                        Operation::Read(_) => {}
+                        Operation::Write(Err(e)) => {
+                            assert!(self.last_write_err.is_none());
+                            self.last_write_err = Some(e.kind());
+                        }
+                        Operation::Write(_) => {}
+                        Operation::Seek(_) => {}
+                    }
+                }
+            }
+        }
+    }
+
+    fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
+        loop {
+            match self.state {
+                Idle(_) => panic!("must call start_seek before calling poll_complete"),
+                Busy(ref mut rx) => {
+                    let (op, buf) = ready!(Pin::new(rx).poll(cx))?;
+                    self.state = Idle(Some(buf));
+
+                    match op {
+                        Operation::Read(_) => {}
+                        Operation::Write(Err(e)) => {
+                            assert!(self.last_write_err.is_none());
+                            self.last_write_err = Some(e.kind());
+                        }
+                        Operation::Write(_) => {}
+                        Operation::Seek(res) => return Ready(res),
                     }
                 }
             }
@@ -598,5 +721,19 @@ impl fmt::Debug for File {
         fmt.debug_struct("tokio::fs::File")
             .field("std", &self.std)
             .finish()
+    }
+}
+
+#[cfg(unix)]
+impl std::os::unix::io::AsRawFd for File {
+    fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+        self.std.as_raw_fd()
+    }
+}
+
+#[cfg(windows)]
+impl std::os::windows::io::AsRawHandle for File {
+    fn as_raw_handle(&self) -> std::os::windows::io::RawHandle {
+        self.std.as_raw_handle()
     }
 }

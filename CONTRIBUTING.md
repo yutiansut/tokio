@@ -15,12 +15,12 @@ It should be considered a map to help you navigate the process.
 The [dev channel][dev] is available for any concerns not covered in this guide, please join
 us!
 
-[dev]: https://gitter.im/tokio-rs/dev
+[dev]: https://discord.gg/6yGkFeN
 
 ## Conduct
 
 The Tokio project adheres to the [Rust Code of Conduct][coc]. This describes
-the _minimum_ behavior expected from all contributors.
+the _minimum_ behavior expected from all contributors. Instances of violations of the Code of Conduct can be reported by contacting the project team at [moderation@tokio.rs](mailto:moderation@tokio.rs).
 
 [coc]: https://github.com/rust-lang/rust/blob/master/CODE_OF_CONDUCT.md
 
@@ -111,6 +111,39 @@ documentation) are greatly appreciated. Before making a large change, it is
 usually a good idea to first open an issue describing the change to solicit
 feedback and guidance. This will increase the likelihood of the PR getting
 merged.
+
+### Cargo Commands
+
+Due to the extensive use of features in Tokio, you will often need to add extra
+arguments to many common cargo commands. This section lists some commonly needed
+commands.
+
+Some commands just need the `--all-features` argument:
+```
+cargo build --all-features
+cargo check --all-features
+cargo test --all-features
+```
+When building documentation normally, the markers that list the features
+required for various parts of Tokio are missing. To build the documentation
+correctly, use this command:
+```
+RUSTDOCFLAGS="--cfg docsrs" cargo +nightly doc --all-features
+```
+The `cargo fmt` command does not work on the Tokio codebase. You can use the
+command below instead:
+```
+rustfmt --check --edition 2018 $(find . -name '*.rs' -print)
+```
+The `--check` argument prints the things that need to be fixed. If you remove
+it, `rustfmt` will update your files locally instead.
+
+You can run loom tests with
+```
+cd tokio # tokio crate in workspace
+LOOM_MAX_PREEMPTIONS=1 RUSTFLAGS="--cfg loom" \
+    cargo test --lib --release --features full -- --test-threads=1 --nocapture
+```
 
 ### Tests
 

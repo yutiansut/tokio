@@ -33,7 +33,7 @@ impl UdpSocket {
         Err(last_err.unwrap_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "could not resolve to any addresses",
+                "could not resolve to any address",
             )
         }))
     }
@@ -57,18 +57,23 @@ impl UdpSocket {
     /// This can be used in conjunction with net2's `UdpBuilder` interface to
     /// configure a socket before it's handed off, such as setting options like
     /// `reuse_address` or binding to multiple addresses.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if thread-local runtime is not set.
+    ///
+    /// The runtime is usually set implicitly when this function is called
+    /// from a future driven by a tokio runtime, otherwise runtime can be set
+    /// explicitly with [`Handle::enter`](crate::runtime::Handle::enter) function.
     pub fn from_std(socket: net::UdpSocket) -> io::Result<UdpSocket> {
         let io = mio::net::UdpSocket::from_socket(socket)?;
         let io = PollEvented::new(io)?;
         Ok(UdpSocket { io })
     }
 
-    /// Split the `UdpSocket` into a receive half and a send half. The two parts
+    /// Splits the `UdpSocket` into a receive half and a send half. The two parts
     /// can be used to receive and send datagrams concurrently, even from two
     /// different tasks.
-    ///
-    /// See the module level documenation of [`split`](super::split) for more
-    /// details.
     pub fn split(self) -> (RecvHalf, SendHalf) {
         split(self)
     }
@@ -95,7 +100,7 @@ impl UdpSocket {
         Err(last_err.unwrap_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "could not resolve to any addresses",
+                "could not resolve to any address",
             )
         }))
     }

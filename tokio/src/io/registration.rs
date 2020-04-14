@@ -1,9 +1,9 @@
-use crate::io::driver::{Direction, Handle, platform};
+use crate::io::driver::{platform, Direction, Handle};
 use crate::util::slab::Address;
 
 use mio::{self, Evented};
-use std::task::{Context, Poll};
 use std::io;
+use std::task::{Context, Poll};
 
 cfg_io_driver! {
     /// Associates an I/O resource with the reactor instance that drives it.
@@ -30,7 +30,7 @@ cfg_io_driver! {
     /// ## Platform-specific events
     ///
     /// `Registration` also allows receiving platform-specific `mio::Ready`
-    /// events.  These events are included as part of the read readiness event
+    /// events. These events are included as part of the read readiness event
     /// stream. The write readiness event stream is only for `Ready::writable()`
     /// events.
     ///
@@ -47,12 +47,21 @@ cfg_io_driver! {
 // ===== impl Registration =====
 
 impl Registration {
-    /// Register the I/O resource with the default reactor.
+    /// Registers the I/O resource with the default reactor.
     ///
     /// # Return
     ///
     /// - `Ok` if the registration happened successfully
     /// - `Err` if an error was encountered during registration
+    ///
+    ///
+    /// # Panics
+    ///
+    /// This function panics if thread-local runtime is not set.
+    ///
+    /// The runtime is usually set implicitly when this function is called
+    /// from a future driven by a tokio runtime, otherwise runtime can be set
+    /// explicitly with [`Handle::enter`](crate::runtime::Handle::enter) function.
     pub fn new<T>(io: &T) -> io::Result<Registration>
     where
         T: Evented,
@@ -70,7 +79,7 @@ impl Registration {
         Ok(Registration { handle, address })
     }
 
-    /// Deregister the I/O resource from the reactor it is associated with.
+    /// Deregisters the I/O resource from the reactor it is associated with.
     ///
     /// This function must be called before the I/O resource associated with the
     /// registration is dropped.
@@ -97,7 +106,7 @@ impl Registration {
         inner.deregister_source(io)
     }
 
-    /// Poll for events on the I/O resource's read readiness stream.
+    /// Polls for events on the I/O resource's read readiness stream.
     ///
     /// If the I/O resource receives a new read readiness event since the last
     /// call to `poll_read_ready`, it is returned. If it has not, the current
@@ -130,6 +139,9 @@ impl Registration {
     ///
     /// This function will panic if called from outside of a task context.
     pub fn poll_read_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<mio::Ready>> {
+        // Keep track of task budget
+        ready!(crate::coop::poll_proceed(cx));
+
         let v = self.poll_ready(Direction::Read, Some(cx))?;
         match v {
             Some(v) => Poll::Ready(Ok(v)),
@@ -148,7 +160,7 @@ impl Registration {
         self.poll_ready(Direction::Read, None)
     }
 
-    /// Poll for events on the I/O resource's write readiness stream.
+    /// Polls for events on the I/O resource's write readiness stream.
     ///
     /// If the I/O resource receives a new write readiness event since the last
     /// call to `poll_write_ready`, it is returned. If it has not, the current
@@ -181,6 +193,9 @@ impl Registration {
     ///
     /// This function will panic if called from outside of a task context.
     pub fn poll_write_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<mio::Ready>> {
+        // Keep track of task budget
+        ready!(crate::coop::poll_proceed(cx));
+
         let v = self.poll_ready(Direction::Write, Some(cx))?;
         match v {
             Some(v) => Poll::Ready(Ok(v)),
@@ -188,7 +203,7 @@ impl Registration {
         }
     }
 
-    /// Consume any pending write readiness event.
+    /// Consumes any pending write readiness event.
     ///
     /// This function is identical to [`poll_write_ready`] **except** that it
     /// will not notify the current task when a new event is received. As such,
@@ -199,7 +214,7 @@ impl Registration {
         self.poll_ready(Direction::Write, None)
     }
 
-    /// Poll for events on the I/O resource's `direction` readiness stream.
+    /// Polls for events on the I/O resource's `direction` readiness stream.
     ///
     /// If called with a task context, notify the task when a new event is
     /// received.
@@ -220,18 +235,26 @@ impl Registration {
         }
 
         let mask = direction.mask();
-        let mask_no_hup = (mask - platform::hup()).as_usize();
+        let mask_no_hup = (mask - platform::hup() - platform::error()).as_usize();
 
         let sched = inner.io_dispatch.get(self.address).unwrap();
 
-        // This consumes the current readiness state **except** for HUP. HUP is
-        // excluded because a) it is a final state and never transitions out of
-        // HUP and b) both the read AND the write directions need to be able to
-        // observe this state.
+        // This consumes the current readiness state **except** for HUP and
+        // error. HUP and error are excluded because a) they are final states
+        // and never transitition out and b) both the read AND the write
+        // directions need to be able to obvserve these states.
         //
-        // If HUP were to be cleared when `direction` is `Read`, then when
-        // `poll_ready` is called again with a _`direction` of `Write`, the HUP
-        // state would not be visible.
+        // # Platform-specific behavior
+        //
+        // HUP and error readiness are platform-specific. On epoll platforms,
+        // HUP has specific conditions that must be met by both peers of a
+        // connection in order to be triggered.
+        //
+        // On epoll platforms, `EPOLLERR` is signaled through
+        // `UnixReady::error()` and is important to be observable by both read
+        // AND write. A specific case that `EPOLLERR` occurs is when the read
+        // end of a pipe is closed. When this occurs, a peer blocked by
+        // writing to the pipe should be notified.
         let curr_ready = sched
             .set_readiness(self.address, |curr| curr & (!mask_no_hup))
             .unwrap_or_else(|_| panic!("address {:?} no longer valid!", self.address));

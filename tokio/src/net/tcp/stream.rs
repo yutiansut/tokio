@@ -3,6 +3,8 @@ use crate::io::{AsyncRead, AsyncWrite, PollEvented};
 use crate::net::tcp::split::{split, ReadHalf, WriteHalf};
 use crate::net::ToSocketAddrs;
 
+use bytes::Buf;
+use iovec::IoVec;
 use std::convert::TryFrom;
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -18,9 +20,9 @@ cfg_tcp! {
     /// A TCP stream can either be created by connecting to an endpoint, via the
     /// [`connect`] method, or by [accepting] a connection from a [listener].
     ///
-    /// [`connect`]: struct.TcpStream.html#method.connect
-    /// [accepting]: struct.TcpListener.html#method.accept
-    /// [listener]: struct.TcpListener.html
+    /// [`connect`]: method@TcpStream::connect
+    /// [accepting]: method@super::TcpListener::accept
+    /// [listener]: struct@super::TcpListener
     ///
     /// # Examples
     ///
@@ -89,12 +91,12 @@ impl TcpStream {
         Err(last_err.unwrap_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "could not resolve to any addresses",
+                "could not resolve to any address",
             )
         }))
     }
 
-    /// Establish a connection to the specified `addr`.
+    /// Establishes a connection to the specified `addr`.
     async fn connect_addr(addr: SocketAddr) -> io::Result<TcpStream> {
         let sys = mio::net::TcpStream::connect(&addr)?;
         let stream = TcpStream::new(sys)?;
@@ -119,7 +121,7 @@ impl TcpStream {
         Ok(TcpStream { io })
     }
 
-    /// Create a new `TcpStream` from a `std::net::TcpStream`.
+    /// Creates new `TcpStream` from a `std::net::TcpStream`.
     ///
     /// This function will convert a TCP stream created by the standard library
     /// to a TCP stream ready to be used with the provided event loop handle.
@@ -137,13 +139,21 @@ impl TcpStream {
     ///     Ok(())
     /// }
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// This function panics if thread-local runtime is not set.
+    ///
+    /// The runtime is usually set implicitly when this function is called
+    /// from a future driven by a tokio runtime, otherwise runtime can be set
+    /// explicitly with [`Handle::enter`](crate::runtime::Handle::enter) function.
     pub fn from_std(stream: net::TcpStream) -> io::Result<TcpStream> {
         let io = mio::net::TcpStream::from_stream(stream)?;
         let io = PollEvented::new(io)?;
         Ok(TcpStream { io })
     }
 
-    // Connect a TcpStream asynchronously that may be built with a net2 TcpBuilder.
+    // Connects `TcpStream` asynchronously that may be built with a net2 `TcpBuilder`.
     //
     // This should be removed in favor of some in-crate TcpSocket builder API.
     #[doc(hidden)]
@@ -186,6 +196,7 @@ impl TcpStream {
     }
 
     /// Returns the remote address that this stream is connected to.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -202,7 +213,51 @@ impl TcpStream {
         self.io.get_ref().peer_addr()
     }
 
-    fn poll_peek(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+    /// Attempts to receive data on the socket, without removing that data from
+    /// the queue, registering the current task for wakeup if data is not yet
+    /// available.
+    ///
+    /// # Return value
+    ///
+    /// The function returns:
+    ///
+    /// * `Poll::Pending` if data is not yet available.
+    /// * `Poll::Ready(Ok(n))` if data is available. `n` is the number of bytes peeked.
+    /// * `Poll::Ready(Err(e))` if an error is encountered.
+    ///
+    /// # Errors
+    ///
+    /// This function may encounter any standard I/O error except `WouldBlock`.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use tokio::io;
+    /// use tokio::net::TcpStream;
+    ///
+    /// use futures::future::poll_fn;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> io::Result<()> {
+    ///     let mut stream = TcpStream::connect("127.0.0.1:8000").await?;
+    ///     let mut buf = [0; 10];
+    ///
+    ///     poll_fn(|cx| {
+    ///         stream.poll_peek(cx, &mut buf)
+    ///     }).await?;
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn poll_peek(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+        self.poll_peek2(cx, buf)
+    }
+
+    pub(super) fn poll_peek2(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
         ready!(self.io.poll_read_ready(cx, mio::Ready::readable()))?;
 
         match self.io.get_ref().peek(buf) {
@@ -283,7 +338,7 @@ impl TcpStream {
     ///
     /// For more information about this option, see [`set_nodelay`].
     ///
-    /// [`set_nodelay`]: #method.set_nodelay
+    /// [`set_nodelay`]: TcpStream::set_nodelay
     ///
     /// # Examples
     ///
@@ -329,7 +384,7 @@ impl TcpStream {
     ///
     /// For more information about this option, see [`set_recv_buffer_size`].
     ///
-    /// [`set_recv_buffer_size`]: #tymethod.set_recv_buffer_size
+    /// [`set_recv_buffer_size`]: TcpStream::set_recv_buffer_size
     ///
     /// # Examples
     ///
@@ -370,18 +425,9 @@ impl TcpStream {
 
     /// Gets the value of the `SO_SNDBUF` option on this socket.
     ///
-    /// For more information about this option, see [`set_send_buffer`].
+    /// For more information about this option, see [`set_send_buffer_size`].
     ///
-    /// [`set_send_buffer`]: #tymethod.set_send_buffer
-    ///
-    /// # Examples
-    ///
-    /// Returns whether keepalive messages are enabled on this socket, and if so
-    /// the duration of time between them.
-    ///
-    /// For more information about this option, see [`set_keepalive`].
-    ///
-    /// [`set_keepalive`]: #tymethod.set_keepalive
+    /// [`set_send_buffer_size`]: TcpStream::set_send_buffer_size
     ///
     /// # Examples
     ///
@@ -425,7 +471,7 @@ impl TcpStream {
     ///
     /// For more information about this option, see [`set_keepalive`].
     ///
-    /// [`set_keepalive`]: #tymethod.set_keepalive
+    /// [`set_keepalive`]: TcpStream::set_keepalive
     ///
     /// # Examples
     ///
@@ -476,7 +522,7 @@ impl TcpStream {
     ///
     /// For more information about this option, see [`set_ttl`].
     ///
-    /// [`set_ttl`]: #tymethod.set_ttl
+    /// [`set_ttl`]: TcpStream::set_ttl
     ///
     /// # Examples
     ///
@@ -520,7 +566,7 @@ impl TcpStream {
     ///
     /// For more information about this option, see [`set_linger`].
     ///
-    /// [`set_linger`]: #tymethod.set_linger
+    /// [`set_linger`]: TcpStream::set_linger
     ///
     /// # Examples
     ///
@@ -543,7 +589,7 @@ impl TcpStream {
     ///
     /// This option controls the action taken when a stream has unsent messages
     /// and the stream is closed. If `SO_LINGER` is set, the system
-    /// shall block the process  until it can transmit the data or until the
+    /// shall block the process until it can transmit the data or until the
     /// time expires.
     ///
     /// If `SO_LINGER` is not specified, and the stream is closed, the system
@@ -566,11 +612,8 @@ impl TcpStream {
         self.io.get_ref().set_linger(dur)
     }
 
-    /// Split a `TcpStream` into a read half and a write half, which can be used
+    /// Splits a `TcpStream` into a read half and a write half, which can be used
     /// to read and write the stream concurrently.
-    ///
-    /// See the module level documenation of [`split`](super::split) for more
-    /// details.
     pub fn split(&mut self) -> (ReadHalf<'_>, WriteHalf<'_>) {
         split(self)
     }
@@ -602,7 +645,7 @@ impl TcpStream {
         }
     }
 
-    pub(crate) fn poll_write_priv(
+    pub(super) fn poll_write_priv(
         &self,
         cx: &mut Context<'_>,
         buf: &[u8],
@@ -615,6 +658,109 @@ impl TcpStream {
                 Poll::Pending
             }
             x => Poll::Ready(x),
+        }
+    }
+
+    pub(super) fn poll_write_buf_priv<B: Buf>(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &mut B,
+    ) -> Poll<io::Result<usize>> {
+        use std::io::IoSlice;
+
+        ready!(self.io.poll_write_ready(cx))?;
+
+        // The `IoVec` (v0.1.x) type can't have a zero-length size, so create
+        // a dummy version from a 1-length slice which we'll overwrite with
+        // the `bytes_vectored` method.
+        static S: &[u8] = &[0];
+        const MAX_BUFS: usize = 64;
+
+        // IoSlice isn't Copy, so we must expand this manually ;_;
+        let mut slices: [IoSlice<'_>; MAX_BUFS] = [
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+            IoSlice::new(S),
+        ];
+        let cnt = buf.bytes_vectored(&mut slices);
+
+        let iovec = <&IoVec>::from(S);
+        let mut vecs = [iovec; MAX_BUFS];
+        for i in 0..cnt {
+            vecs[i] = (*slices[i]).into();
+        }
+
+        match self.io.get_ref().write_bufs(&vecs[..cnt]) {
+            Ok(n) => {
+                buf.advance(n);
+                Poll::Ready(Ok(n))
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                self.io.clear_write_ready(cx)?;
+                Poll::Pending
+            }
+            Err(e) => Poll::Ready(Err(e)),
         }
     }
 }
@@ -668,6 +814,14 @@ impl AsyncWrite for TcpStream {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         self.poll_write_priv(cx, buf)
+    }
+
+    fn poll_write_buf<B: Buf>(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut B,
+    ) -> Poll<io::Result<usize>> {
+        self.poll_write_buf_priv(cx, buf)
     }
 
     #[inline]

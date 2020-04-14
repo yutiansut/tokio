@@ -11,20 +11,24 @@
 //! * [`UdpSocket`] provides functionality for communication over UDP
 //! * [`UnixListener`] and [`UnixStream`] provide functionality for communication over a
 //! Unix Domain Stream Socket **(available on Unix only)**
-//! * [`UnixDatagram`] and [`UnixDatagramFramed`] provide functionality for communication
+//! * [`UnixDatagram`] provides functionality for communication
 //! over Unix Domain Datagram Socket **(available on Unix only)**
 
 //!
-//! [`TcpListener`]: struct.TcpListener.html
-//! [`TcpStream`]: struct.TcpStream.html
-//! [`UdpSocket`]: struct.UdpSocket.html
-//! [`UnixListener`]: struct.UnixListener.html
-//! [`UnixStream`]: struct.UnixStream.html
-//! [`UnixDatagram`]: struct.UnixDatagram.html
-//! [`UnixDatagramFramed`]: struct.UnixDatagramFramed.html
+//! [`TcpListener`]: TcpListener
+//! [`TcpStream`]: TcpStream
+//! [`UdpSocket`]: UdpSocket
+//! [`UnixListener`]: UnixListener
+//! [`UnixStream`]: UnixStream
+//! [`UnixDatagram`]: UnixDatagram
 
 mod addr;
 pub use addr::ToSocketAddrs;
+
+cfg_dns! {
+    mod lookup_host;
+    pub use lookup_host::lookup_host;
+}
 
 cfg_tcp! {
     pub mod tcp;

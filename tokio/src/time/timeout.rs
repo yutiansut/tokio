@@ -2,7 +2,7 @@
 //!
 //! See [`Timeout`] documentation for more details.
 //!
-//! [`Timeout`]: struct.Timeout.html
+//! [`Timeout`]: struct@Timeout
 
 use crate::time::{delay_until, Delay, Duration, Instant};
 
@@ -14,7 +14,8 @@ use std::task::{self, Poll};
 /// Require a `Future` to complete before the specified duration has elapsed.
 ///
 /// If the future completes before the duration has elapsed, then the completed
-/// value is returned. Otherwise, an error is returned.
+/// value is returned. Otherwise, an error is returned and the future is
+/// canceled.
 ///
 /// # Cancelation
 ///
@@ -107,8 +108,16 @@ pub struct Timeout<T> {
 }
 
 /// Error returned by `Timeout`.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct Elapsed(());
+
+impl Elapsed {
+    // Used on StreamExt::timeout
+    #[allow(unused)]
+    pub(crate) fn new() -> Self {
+        Elapsed(())
+    }
+}
 
 impl<T> Timeout<T> {
     pub(crate) fn new_with_delay(value: T, delay: Delay) -> Timeout<T> {

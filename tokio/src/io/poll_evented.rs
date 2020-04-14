@@ -1,5 +1,5 @@
+use crate::io::driver::platform;
 use crate::io::{AsyncRead, AsyncWrite, Registration};
-use crate::io::driver::{platform};
 
 use mio::event::Evented;
 use std::fmt;
@@ -27,7 +27,7 @@ cfg_io_driver! {
     /// **Note**: While `PollEvented` is `Sync` (if the underlying I/O type is
     /// `Sync`), the caller must ensure that there are at most two tasks that
     /// use a `PollEvented` instance concurrently. One for reading and one for
-    /// writing.  While violating this requirement is "safe" from a Rust memory
+    /// writing. While violating this requirement is "safe" from a Rust memory
     /// model point of view, it will result in unexpected behavior in the form
     /// of lost notifications and tasks hanging.
     ///
@@ -95,7 +95,7 @@ cfg_io_driver! {
     /// [`AsyncRead`]: ../io/trait.AsyncRead.html
     /// [`AsyncWrite`]: ../io/trait.AsyncWrite.html
     /// [`mio::Evented`]: https://docs.rs/mio/0.6/mio/trait.Evented.html
-    /// [`Registration`]: struct.Registration.html
+    /// [`Registration`]: struct@Registration
     /// [`TcpListener`]: ../net/struct.TcpListener.html
     /// [`clear_read_ready`]: #method.clear_read_ready
     /// [`clear_write_ready`]: #method.clear_write_ready
@@ -123,7 +123,7 @@ macro_rules! poll_ready {
     ($me:expr, $mask:expr, $cache:ident, $take:ident, $poll:expr) => {{
         // Load cached & encoded readiness.
         let mut cached = $me.inner.$cache.load(Relaxed);
-        let mask = $mask | platform::hup();
+        let mask = $mask | platform::hup() | platform::error();
 
         // See if the current readiness matches any bits.
         let mut ret = mio::Ready::from_usize(cached) & $mask;
@@ -166,6 +166,14 @@ where
     E: Evented,
 {
     /// Creates a new `PollEvented` associated with the default reactor.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if thread-local runtime is not set.
+    ///
+    /// The runtime is usually set implicitly when this function is called
+    /// from a future driven by a tokio runtime, otherwise runtime can be set
+    /// explicitly with [`Handle::enter`](crate::runtime::Handle::enter) function.
     pub fn new(io: E) -> io::Result<Self> {
         let registration = Registration::new(&io)?;
         Ok(Self {
@@ -204,7 +212,7 @@ where
         Ok(io)
     }
 
-    /// Check the I/O resource's read readiness state.
+    /// Checks the I/O resource's read readiness state.
     ///
     /// The mask argument allows specifying what readiness to notify on. This
     /// can be any value, including platform specific readiness, **except**
@@ -272,12 +280,12 @@ where
         Ok(())
     }
 
-    /// Check the I/O resource's write readiness state.
+    /// Checks the I/O resource's write readiness state.
     ///
     /// This always checks for writable readiness and also checks for HUP
     /// readiness on platforms that support it.
     ///
-    /// If the resource is not ready for a write then `Async::NotReady` is
+    /// If the resource is not ready for a write then `Poll::Pending` is
     /// returned and the current task is notified once a new event is received.
     ///
     /// The I/O resource will remain in a write-ready state until readiness is

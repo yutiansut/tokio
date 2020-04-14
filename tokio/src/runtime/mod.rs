@@ -4,7 +4,7 @@
 //! runtime support. In particular, the following runtime services are
 //! necessary:
 //!
-//! * An **I/O event loop**, called the [driver], which drives I/O resources and
+//! * An **I/O event loop**, called the driver, which drives I/O resources and
 //!   dispatches I/O events to tasks that depend on them.
 //! * A **scheduler** to execute [tasks] that use these I/O resources.
 //! * A **timer** for scheduling work to run after a set period of time.
@@ -107,7 +107,7 @@
 //!
 //! ## Runtime Configurations
 //!
-//! Tokio provides multiple task scheding strategies, suitable for different
+//! Tokio provides multiple task scheduling strategies, suitable for different
 //! applications. The [runtime builder] or `#[tokio::main]` attribute may be
 //! used to select which scheduler to use.
 //!
@@ -148,7 +148,7 @@
 //! ```
 //!
 //! If the `rt-threaded` feature flag is enabled, [`Runtime::new`] will return a
-//! basic scheduler runtime by default.
+//! threaded scheduler runtime by default.
 //!
 //! Most applications should use the threaded scheduler, except in some niche
 //! use-cases, such as when running only a single thread is required.
@@ -161,14 +161,20 @@
 //! This is done with [`Builder::enable_io`] and [`Builder::enable_time`]. As a
 //! shorthand, [`Builder::enable_all`] enables both resource drivers.
 //!
+//! ## Lifetime of spawned threads
+//!
+//! The runtime may spawn threads depending on its configuration and usage. The
+//! threaded scheduler spawns threads to schedule tasks and calls to
+//! `spawn_blocking` spawn threads to run blocking operations.
+//!
+//! While the `Runtime` is active, threads may shutdown after periods of being
+//! idle. Once `Runtime` is dropped, all runtime threads are forcibly shutdown.
+//! Any tasks that have not yet completed will be dropped.
+//!
 //! [tasks]: crate::task
-//! [driver]: crate::io::driver
-//! [executor]: https://tokio.rs/docs/internals/runtime-model/#executors
-//! [`Runtime`]: struct.Runtime.html
-//! [`Reactor`]: ../reactor/struct.Reactor.html
-//! [`run`]: fn.run.html
-//! [`tokio::spawn`]: ../executor/fn.spawn.html
-//! [`tokio::main`]: ../../tokio_macros/attr.main.html
+//! [`Runtime`]: Runtime
+//! [`tokio::spawn`]: crate::spawn
+//! [`tokio::main`]: ../attr.main.html
 //! [runtime builder]: crate::runtime::Builder
 //! [`Runtime::new`]: crate::runtime::Runtime::new
 //! [`Builder::basic_scheduler`]: crate::runtime::Builder::basic_scheduler
@@ -182,16 +188,21 @@
 #[macro_use]
 mod tests;
 
+pub(crate) mod context;
+
 cfg_rt_core! {
     mod basic_scheduler;
     use basic_scheduler::BasicScheduler;
+
+    pub(crate) mod task;
 }
 
 mod blocking;
 use blocking::BlockingPool;
 
 cfg_blocking_impl! {
-    pub(crate) use blocking::spawn_blocking;
+    #[allow(unused_imports)]
+    pub(crate) use blocking::{spawn_blocking, try_spawn_blocking};
 }
 
 mod builder;
@@ -200,19 +211,14 @@ pub use self::builder::Builder;
 pub(crate) mod enter;
 use self::enter::enter;
 
-cfg_rt_core! {
-    mod global;
-    pub(crate) use global::spawn;
-}
-
 mod handle;
-pub use self::handle::Handle;
+pub use self::handle::{Handle, TryCurrentError};
 
 mod io;
 
 cfg_rt_threaded! {
     mod park;
-    use park::{Parker, Unparker};
+    use park::Parker;
 }
 
 mod shell;
@@ -224,6 +230,8 @@ use self::spawner::Spawner;
 mod time;
 
 cfg_rt_threaded! {
+    mod queue;
+
     pub(crate) mod thread_pool;
     use self::thread_pool::ThreadPool;
 }
@@ -233,10 +241,11 @@ cfg_rt_core! {
 }
 
 use std::future::Future;
+use std::time::Duration;
 
 /// The Tokio runtime.
 ///
-/// The runtime provides an I/O [driver], task scheduler, [timer], and blocking
+/// The runtime provides an I/O driver, task scheduler, [timer], and blocking
 /// pool, necessary for running asynchronous tasks.
 ///
 /// Instances of `Runtime` can be created using [`new`] or [`Builder`]. However,
@@ -257,12 +266,11 @@ use std::future::Future;
 /// that reactor will no longer function. Calling any method on them will
 /// result in an error.
 ///
-/// [driver]: crate::io::driver
 /// [timer]: crate::time
 /// [mod]: index.html
 /// [`new`]: #method.new
-/// [`Builder`]: struct.Builder.html
-/// [`tokio::run`]: fn.run.html
+/// [`Builder`]: struct@Builder
+/// [`tokio::run`]: fn@run
 #[derive(Debug)]
 pub struct Runtime {
     /// Task executor
@@ -292,7 +300,7 @@ enum Kind {
 }
 
 /// After thread starts / before thread stops
-type Callback = ::std::sync::Arc<dyn Fn() + Send + Sync>;
+type Callback = std::sync::Arc<dyn Fn() + Send + Sync>;
 
 impl Runtime {
     /// Create a new runtime instance with default configuration values.
@@ -303,8 +311,8 @@ impl Runtime {
     /// scheduler] is used, while if only the `rt-core` feature is enabled, the
     /// [basic scheduler] is used instead.
     ///
-    /// If the threaded cheduler is selected, it will not spawn
-    /// any worker threads until it  needs to, i.e. tasks are scheduled to run.
+    /// If the threaded scheduler is selected, it will not spawn
+    /// any worker threads until it needs to, i.e. tasks are scheduled to run.
     ///
     /// Most applications will not need to call this function directly. Instead,
     /// they will use the  [`#[tokio::main]` attribute][main]. When more complex
@@ -330,7 +338,7 @@ impl Runtime {
     /// [threaded scheduler]: index.html#threaded-scheduler
     /// [basic scheduler]: index.html#basic-scheduler
     /// [runtime builder]: crate::runtime::Builder
-    pub fn new() -> io::Result<Self> {
+    pub fn new() -> io::Result<Runtime> {
         #[cfg(feature = "rt-threaded")]
         let ret = Builder::new().threaded_scheduler().enable_all().build();
 
@@ -412,7 +420,7 @@ impl Runtime {
         })
     }
 
-    /// Enter the runtime context
+    /// Enter the runtime context.
     pub fn enter<F, R>(&self, f: F) -> R
     where
         F: FnOnce() -> R,
@@ -422,7 +430,8 @@ impl Runtime {
 
     /// Return a handle to the runtime's spawner.
     ///
-    /// The returned handle can be used to spawn tasks that run on this runtime.
+    /// The returned handle can be used to spawn tasks that run on this runtime, and can
+    /// be cloned to allow moving the `Handle` to other threads.
     ///
     /// # Examples
     ///
@@ -438,5 +447,47 @@ impl Runtime {
     /// ```
     pub fn handle(&self) -> &Handle {
         &self.handle
+    }
+
+    /// Shutdown the runtime, waiting for at most `duration` for all spawned
+    /// task to shutdown.
+    ///
+    /// Usually, dropping a `Runtime` handle is sufficient as tasks are able to
+    /// shutdown in a timely fashion. However, dropping a `Runtime` will wait
+    /// indefinitely for all tasks to terminate, and there are cases where a long
+    /// blocking task has been spawned which can block dropping `Runtime`.
+    ///
+    /// In this case, calling `shutdown_timeout` with an explicit wait timeout
+    /// can work. The `shutdown_timeout` will signal all tasks to shutdown and
+    /// will wait for at most `duration` for all spawned tasks to terminate. If
+    /// `timeout` elapses before all tasks are dropped, the function returns and
+    /// outstanding tasks are potentially leaked.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tokio::runtime::Runtime;
+    /// use tokio::task;
+    ///
+    /// use std::thread;
+    /// use std::time::Duration;
+    ///
+    /// fn main() {
+    ///    let mut runtime = Runtime::new().unwrap();
+    ///
+    ///    runtime.block_on(async move {
+    ///        task::spawn_blocking(move || {
+    ///            thread::sleep(Duration::from_secs(10_000));
+    ///        });
+    ///    });
+    ///
+    ///    runtime.shutdown_timeout(Duration::from_millis(100));
+    /// }
+    /// ```
+    pub fn shutdown_timeout(self, duration: Duration) {
+        let Runtime {
+            mut blocking_pool, ..
+        } = self;
+        blocking_pool.shutdown(Some(duration));
     }
 }

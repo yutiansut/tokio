@@ -1,8 +1,8 @@
-use crate::loom::cell::CausalCell;
+use crate::loom::cell::UnsafeCell;
 use crate::loom::future::AtomicWaker;
 use crate::loom::sync::atomic::AtomicUsize;
 use crate::loom::sync::Arc;
-use crate::sync::mpsc::error::ClosedError;
+use crate::sync::mpsc::error::{ClosedError, TryRecvError};
 use crate::sync::mpsc::{error, list};
 
 use std::fmt;
@@ -114,7 +114,7 @@ struct Chan<T, S> {
     tx_count: AtomicUsize,
 
     /// Only accessed by `Rx` handle.
-    rx_fields: CausalCell<RxFields<T>>,
+    rx_fields: UnsafeCell<RxFields<T>>,
 }
 
 impl<T, S> fmt::Debug for Chan<T, S>
@@ -164,7 +164,7 @@ where
         semaphore,
         rx_waker: AtomicWaker::new(),
         tx_count: AtomicUsize::new(1),
-        rx_fields: CausalCell::new(RxFields {
+        rx_fields: UnsafeCell::new(RxFields {
             list: rx,
             rx_closed: false,
         }),
@@ -190,9 +190,20 @@ where
         self.inner.semaphore.poll_acquire(cx, &mut self.permit)
     }
 
+    pub(crate) fn disarm(&mut self) {
+        // TODO: should this error if not acquired?
+        self.inner.semaphore.drop_permit(&mut self.permit)
+    }
+
     /// Send a message and notify the receiver.
     pub(crate) fn try_send(&mut self, value: T) -> Result<(), (T, TrySendError)> {
         self.inner.try_send(value, &mut self.permit)
+    }
+}
+
+impl<T> Tx<T, (crate::sync::semaphore_ll::Semaphore, usize)> {
+    pub(crate) fn is_ready(&self) -> bool {
+        self.permit.is_acquired()
     }
 }
 
@@ -265,6 +276,9 @@ where
     pub(crate) fn recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
         use super::block::Read::*;
 
+        // Keep track of task budget
+        ready!(crate::coop::poll_proceed(cx));
+
         self.inner.rx_fields.with_mut(|rx_fields_ptr| {
             let rx_fields = unsafe { &mut *rx_fields_ptr };
 
@@ -279,7 +293,7 @@ where
                             // TODO: This check may not be required as it most
                             // likely can only return `true` at this point. A
                             // channel is closed when all tx handles are
-                            // dropped.  Dropping a tx handle releases memory,
+                            // dropped. Dropping a tx handle releases memory,
                             // which ensures that if dropping the tx handle is
                             // visible, then all messages sent are also visible.
                             assert!(self.inner.semaphore.is_idle());
@@ -303,6 +317,22 @@ where
                 Ready(None)
             } else {
                 Pending
+            }
+        })
+    }
+
+    /// Receives the next value without blocking
+    pub(crate) fn try_recv(&mut self) -> Result<T, TryRecvError> {
+        use super::block::Read::*;
+        self.inner.rx_fields.with_mut(|rx_fields_ptr| {
+            let rx_fields = unsafe { &mut *rx_fields_ptr };
+            match rx_fields.list.pop(&self.inner.tx) {
+                Some(Value(value)) => {
+                    self.inner.semaphore.add_permit();
+                    Ok(value)
+                }
+                Some(Closed) => Err(TryRecvError::Closed),
+                None => Err(TryRecvError::Empty),
             }
         })
     }
@@ -366,7 +396,7 @@ impl<T, S> Drop for Chan<T, S> {
     }
 }
 
-use crate::sync::semaphore::TryAcquireError;
+use crate::sync::semaphore_ll::TryAcquireError;
 
 impl From<TryAcquireError> for TrySendError {
     fn from(src: TryAcquireError) -> TrySendError {
@@ -382,9 +412,9 @@ impl From<TryAcquireError> for TrySendError {
 
 // ===== impl Semaphore for (::Semaphore, capacity) =====
 
-use crate::sync::semaphore::Permit;
+use crate::sync::semaphore_ll::Permit;
 
-impl Semaphore for (crate::sync::semaphore::Semaphore, usize) {
+impl Semaphore for (crate::sync::semaphore_ll::Semaphore, usize) {
     type Permit = Permit;
 
     fn new_permit() -> Permit {
@@ -392,7 +422,7 @@ impl Semaphore for (crate::sync::semaphore::Semaphore, usize) {
     }
 
     fn drop_permit(&self, permit: &mut Permit) {
-        permit.release(&self.0);
+        permit.release(1, &self.0);
     }
 
     fn add_permit(&self) {
@@ -408,18 +438,21 @@ impl Semaphore for (crate::sync::semaphore::Semaphore, usize) {
         cx: &mut Context<'_>,
         permit: &mut Permit,
     ) -> Poll<Result<(), ClosedError>> {
+        // Keep track of task budget
+        ready!(crate::coop::poll_proceed(cx));
+
         permit
-            .poll_acquire(cx, &self.0)
+            .poll_acquire(cx, 1, &self.0)
             .map_err(|_| ClosedError::new())
     }
 
     fn try_acquire(&self, permit: &mut Permit) -> Result<(), TrySendError> {
-        permit.try_acquire(&self.0)?;
+        permit.try_acquire(1, &self.0)?;
         Ok(())
     }
 
     fn forget(&self, permit: &mut Self::Permit) {
-        permit.forget()
+        permit.forget(1);
     }
 
     fn close(&self) {

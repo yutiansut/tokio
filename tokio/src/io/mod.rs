@@ -138,20 +138,20 @@
 //! context of the Tokio runtime, as they require Tokio-specific features to
 //! function. Calling these functions outside of a Tokio runtime will panic.
 //!
-//! [input]: fn.stdin.html
-//! [output]: fn.stdout.html
-//! [error]: fn.stderr.html
+//! [input]: fn@stdin
+//! [output]: fn@stdout
+//! [error]: fn@stderr
 //!
 //! # `std` re-exports
 //!
 //! Additionally, [`Error`], [`ErrorKind`], and [`Result`] are re-exported
 //! from `std::io` for ease of use.
 //!
-//! [`AsyncRead`]: trait.AsyncRead.html
-//! [`AsyncWrite`]: trait.AsyncWrite.html
-//! [`Error`]: struct.Error.html
-//! [`ErrorKind`]: enum.ErrorKind.html
-//! [`Result`]: type.Result.html
+//! [`AsyncRead`]: trait@AsyncRead
+//! [`AsyncWrite`]: trait@AsyncWrite
+//! [`Error`]: struct@Error
+//! [`ErrorKind`]: enum@ErrorKind
+//! [`Result`]: type@Result
 //! [`Read`]: std::io::Read
 //! [`Write`]: std::io::Write
 cfg_io_blocking! {
@@ -163,6 +163,9 @@ pub use self::async_buf_read::AsyncBufRead;
 
 mod async_read;
 pub use self::async_read::AsyncRead;
+
+mod async_seek;
+pub use self::async_seek::AsyncSeek;
 
 mod async_write;
 pub use self::async_write::AsyncWrite;
@@ -192,11 +195,18 @@ cfg_io_util! {
     mod split;
     pub use split::{split, ReadHalf, WriteHalf};
 
+    pub(crate) mod seek;
+    pub use self::seek::Seek;
+
     pub(crate) mod util;
     pub use util::{
-        copy, empty, repeat, sink, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufStream,
-        BufWriter, Copy, Empty, Lines, Repeat, Sink, Split, Take,
+        copy, empty, repeat, sink, AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt,
+        BufReader, BufStream, BufWriter, Copy, Empty, Lines, Repeat, Sink, Split, Take,
     };
+
+    cfg_stream! {
+        pub use util::{stream_reader, StreamReader};
+    }
 
     // Re-export io::Error so that users don't have to deal with conflicts when
     // `use`ing `tokio::io` and `std::io`.

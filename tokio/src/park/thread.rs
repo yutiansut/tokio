@@ -10,15 +10,7 @@ pub(crate) struct ParkThread {
     inner: Arc<Inner>,
 }
 
-/// Error returned by [`ParkThread`]
-///
-/// This currently is never returned, but might at some point in the future.
-///
-/// [`ParkThread`]: struct.ParkThread.html
-#[derive(Debug)]
-pub(crate) struct ParkError {
-    _p: (),
-}
+pub(crate) type ParkError = ();
 
 /// Unblocks a thread that was blocked by `ParkThread`.
 #[derive(Clone, Debug)]
@@ -128,12 +120,16 @@ impl Inner {
 
     fn park_timeout(&self, dur: Duration) {
         // Like `park` above we have a fast path for an already-notified thread,
-        // and afterwards we start coordinating for a sleep.  return quickly.
+        // and afterwards we start coordinating for a sleep. Return quickly.
         if self
             .state
             .compare_exchange(NOTIFIED, EMPTY, SeqCst, SeqCst)
             .is_ok()
         {
+            return;
+        }
+
+        if dur == Duration::from_millis(0) {
             return;
         }
 
@@ -232,12 +228,17 @@ cfg_blocking_impl! {
             }
         }
 
+        pub(crate) fn get_unpark(&self) -> Result<UnparkThread, ParkError> {
+            self.with_current(|park_thread| park_thread.unpark())
+        }
+
         /// Get a reference to the `ParkThread` handle for this thread.
-        fn with_current<F, R>(&self, f: F) -> R
+        fn with_current<F, R>(&self, f: F) -> Result<R, ParkError>
         where
             F: FnOnce(&ParkThread) -> R,
         {
-            CURRENT_PARKER.with(|inner| f(inner))
+            CURRENT_PARKER.try_with(|inner| f(inner))
+                .map_err(|_| ())
         }
     }
 
@@ -246,16 +247,16 @@ cfg_blocking_impl! {
         type Error = ParkError;
 
         fn unpark(&self) -> Self::Unpark {
-            self.with_current(|park_thread| park_thread.unpark())
+            self.get_unpark().unwrap()
         }
 
         fn park(&mut self) -> Result<(), Self::Error> {
-            self.with_current(|park_thread| park_thread.inner.park());
+            self.with_current(|park_thread| park_thread.inner.park())?;
             Ok(())
         }
 
         fn park_timeout(&mut self, duration: Duration) -> Result<(), Self::Error> {
-            self.with_current(|park_thread| park_thread.inner.park_timeout(duration));
+            self.with_current(|park_thread| park_thread.inner.park_timeout(duration))?;
             Ok(())
         }
     }
